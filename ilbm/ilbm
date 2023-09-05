@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) Great J <red-chrome@avaruusmies.com>
+
+import argparse
+import os
+import struct
+import textwrap
+import warnings
+
+# FIXME: make a local copy of chunk
+# https://docs.python.org/3/library/chunk.html
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore",category=DeprecationWarning)
+
+    import chunk
+
+# https://docs.python.org/3/library/struct.html#format-characters
+FOURCC = 'cccc'
+
+INT8 = 'b'
+INT16BE = '>h'
+INT32BE = '>i'
+
+UINT8 = 'B'
+UINT16BE = '>H'
+UINT32BE = '>I'
+
+def byterun1_unpack_it(buf):
+    num_literal = 0
+    num_repeat = 0
+    for val in buf:
+        if num_literal > 0:
+            num_literal -= 1
+            yield val
+        elif num_repeat > 0:
+            for i in range(num_repeat):
+                yield val
+            num_repeat = 0
+        else:
+            # unpack just to match spec values
+            val = struct.unpack(INT8, val.to_bytes(1))[0]
+
+            if 0 <= val <= 127:
+                num_literal = val + 1
+            elif -127 <= val <= -1:
+                num_repeat = -val + 1
+            # -128 is noop
+
+    if num_literal > 0 or num_repeat > 0:
+        raise ValueError # FIXME
+
+def byterun1_unpack(buf):
+    return bytes(byterun1_unpack_it(buf))
+
+def cmap_color4(buf, force_size=None):
+    # 8 bpc to 4 bpc
+    def color4(r, g, b):
+        r >>= 4
+        g >>= 4
+        b >>= 4
+
+        return r << 8 | g << 4 | b
+
+    def split_words(words):
+        for w in words:
+            yield w >> 8
+            yield w & 0xff
+
+    cmap = [color4(r, g, b) for r, g, b in struct.iter_unpack('BBB', buf)]
+
+    # force a specific size
+    if force_size is not None:
+        if len(cmap) > force_size:
+            cmap = cmap[:force_size]
+        elif len(cmap) < force_size:
+            cmap.extend((force_size - len(cmap)) * [0])
+
+    return bytes(split_words(cmap))
+
+class Base:
+    _members = {}
+    _unknown = ''
+
+    def _size(self):
+        return sum([struct.calcsize(fmt) for fmt in self._members.values()])
+
+    def _init_members(self, c):
+        for name, fmt in self._members.items():
+            size = struct.calcsize(fmt)
+            value = struct.unpack(fmt, c.read(size))
+
+            if fmt == FOURCC:
+                value = b''.join(value)
+            else:
+                value = value[0]
+
+            setattr(self, name, value)
+
+    def _init_rest(self, c):
+        data = c.read()
+        setattr(self, 'data', data)
+
+    def __init__(self, c):
+        assert self.type_id == c.getname()
+        self.size = c.getsize()
+
+        self._children = []
+        self._init_members(c)
+        self._init_rest(c)
+
+    def __repr__(self):
+        out = f'{self.type_id.decode("ascii")}:\t{self.size} bytes{self._unknown}\n'
+        for name in self._members.keys():
+            value = getattr(self, name)
+            out += f'\t{name}: {value}\n'
+        if self.data:
+            out += f'\tdata: {len(self.data)} bytes\n'
+        ch = ''
+        for child in self._children:
+            ch += str(child)
+        if ch:
+            out += textwrap.indent(ch, '\t')
+        return out
+
+class Unknown(Base):
+    _unknown = ' (unknown chunk)'
+    def __init__(self, c):
+        self.type_id = c.getname()
+        super().__init__(c)
+
+class FORM(Base):
+    type_id = b'FORM'
+    _members = {
+        'formatID': FOURCC,
+        # data (children)
+        # pad (optional)
+    }
+
+    def __init__(self, c):
+        assert self.type_id == c.getname()
+        self.size = c.getsize()
+
+        self._init_members(c)
+        self._children = chunk_read(c)
+        self._init_rest(c)
+
+    def __iter__(self):
+        yield from self._children
+
+class BMHD(Base):
+    type_id = b'BMHD'
+    _members = {
+        'w': UINT16BE,
+        'h': UINT16BE,
+        'x': INT16BE,
+        'y': INT16BE,
+        'nPlanes': UINT8,
+        'masking': UINT8,
+        'compression': UINT8,
+        'pad1': UINT8,
+        'transparentColor': UINT16BE,
+        'xAspect': UINT8,
+        'yAspect': UINT8,
+        'pageWidth': INT16BE,
+        'pageHeight': INT16BE,
+    }
+
+class BODY(Base):
+    type_id = b'BODY'
+    _members = {
+        # 'data'
+    }
+
+    def __repr__(self):
+        s = super().__repr__()
+        # FIXME: bogus for uncompressed data
+        foo = byterun1_unpack(self.data)
+        return s + f'\tuncompressed len: {len(foo)}\n'
+
+class CAMG(Base):
+    type_id = b'CAMG'
+    _members = {
+        'viewportMode': UINT32BE,
+    }
+
+class CMAP(Base):
+    type_id = b'CMAP'
+    _members = {
+        # 'data'
+    }
+
+class CRNG(Base):
+    type_id = b'CRNG'
+    _members = {
+        'pad1': INT16BE,
+        'rate': INT16BE,
+        'active': INT16BE,
+        'low': UINT8,
+        'high': UINT8,
+    }
+
+class CCRT(Base):
+    type_id = b'CCRT'
+    _members = {
+        'direction': INT16BE,
+        'start': UINT8,
+        'end': UINT8,
+        'seconds': INT32BE,
+        'microseconds': INT32BE,
+        'pad': INT16BE,
+    }
+
+class DEST(Base):
+    type_id = b'DEST'
+    _members = {
+        'depth': UINT8,
+        'pad1': UINT8,
+        'planePick': UINT16BE,
+        'planeOnOff': UINT16BE,
+        'planeMask': UINT16BE,
+    }
+
+class GRAB(Base):
+    type_id = b'GRAB'
+    _members = {
+        'x': INT16BE,
+        'y': INT16BE,
+    }
+
+class SPRT(Base):
+    type_id = b'SPRT'
+    _members = {
+        'SpritePrecedence': UINT16BE,
+    }
+
+class TINY(Base):
+    type_id = b'TINY'
+    _members = {
+        'width': UINT16BE,
+        'height': UINT16BE,
+        # 'data'
+    }
+
+def chunk_read(file):
+    result = []
+    while True:
+        try:
+            c = chunk.Chunk(file)
+        except EOFError:
+            break
+
+        # Known chunk classes
+        known_chunks= [ BMHD, BODY, CAMG, CCRT, CMAP, CRNG, DEST, FORM, GRAB,
+                        SPRT, TINY, ]
+
+        type_id_map = {cls.type_id: cls for cls in known_chunks}
+
+        cls = type_id_map.get(c.getname(), Unknown)
+
+        result.append(cls(c))
+
+        c.close()
+
+    return result
+
+def find_chunk(iterable, type_id):
+    return next((c for c in iterable if c.type_id == type_id), None)
+
+def filename(arg):
+    if not os.path.isfile(arg):
+        raise ValueError
+
+    return arg
+
+def cmap_size(arg):
+    if arg == 'power-of-2':
+        return arg
+
+    arg = int(arg)
+    if arg <= 0:
+        raise ValueError
+
+    return arg
+
+def main():
+    parser = argparse.ArgumentParser(description='Simple ILBM parsing tool.')
+
+    parser.add_argument('ilbm', metavar='ILBM', type=filename, action='store',
+                        help='ILBM file to read')
+    parser.add_argument('--dump', action='store_true',
+                        help='print file structure')
+    parser.add_argument('--cmap', metavar='FILE', action='store',
+                        help='save color map in FILE in Amiga color4 format')
+    parser.add_argument('--cmap-size', metavar='NUM', type=cmap_size, action='store',
+                        help='force color map size, power-of-2 to use 2^numplanes')
+    parser.add_argument('--body', metavar='FILE', action='store',
+                        help='save interleaved bitplanes in FILE')
+
+    args = parser.parse_args()
+
+    with open(args.ilbm, 'rb') as f:
+        ilbm = chunk_read(f)
+
+    if args.dump:
+        for c in ilbm:
+            print(str(c), end='')
+
+    form = find_chunk(ilbm, FORM.type_id)
+    if form is None:
+        raise ValueError # FIXME
+
+    bmhd = find_chunk(form, BMHD.type_id)
+    if bmhd is None:
+        raise ValueError # FIXME
+
+    if args.cmap:
+        cmap = find_chunk(form, CMAP.type_id)
+        if cmap is None:
+            raise ValueError # FIXME
+
+        force_size = args.cmap_size
+        if force_size == 'power-of-2':
+            if bmhd.nPlanes == 0:
+                raise ValueError # FIXME
+
+            force_size = pow(2, bmhd.nPlanes)
+
+        data = cmap_color4(cmap.data, force_size)
+
+        with open(args.cmap, 'wb') as f:
+            f.write(data)
+
+    if args.body:
+        body = find_chunk(form, BODY.type_id)
+
+        if bmhd.compression == 0:
+            data = body.data
+        elif bmhd.compression == 1:
+            data = byterun1_unpack(body.data)
+        else:
+            raise ValueError # FIXME
+
+        # FIXME: this includes mask, remove?
+        with open(args.body, 'wb') as f:
+            f.write(data)
+
+if __name__ == '__main__':
+    main()
