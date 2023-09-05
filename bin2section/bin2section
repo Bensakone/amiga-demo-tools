@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) Great J <red-chrome@avaruusmies.com>
+
+import argparse
+import os
+import re
+
+_section_template='''
+	public	{symbol}
+
+	section	{sec_name},{sec_type},{mem_type}
+
+{symbol}:
+{data}
+{symbol}_end:
+'''
+
+def _data(filename):
+    with open(filename, 'rb') as f:
+        while True:
+            chunk = f.read(16)
+            if not chunk:
+                break
+
+            line = ', '.join(f'${byte:02x}' for byte in chunk)
+
+            yield f'\tdc.b\t{line}'
+
+def _symbol(arg):
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', arg):
+        raise ValueError
+
+    return arg
+
+def _filename(arg):
+    if not os.path.isfile(arg):
+        raise ValueError
+
+    return arg
+
+def _filename_to_symbol(filename):
+    return re.sub(r'[^a-zA-Z0-9_]', '_',
+                  os.path.basename(filename))
+
+def main():
+    parser = argparse.ArgumentParser(description='''Convert binary data to an asm section.
+    Geared towards Amiga m68k and VASM.''')
+
+    parser.add_argument('file', metavar='FILE', type=_filename, action='store',
+                        help='binary file to read')
+    parser.add_argument('--symbol', type=_symbol, action='store',
+                        help='symbol name to add (generated from filename by default)')
+    parser.add_argument('--sec-name', type=_symbol, action='store',
+                        help='section name (defaults to SYMBOL_section)')
+    parser.add_argument('--sec-type', choices=['text', 'data'], default='data',
+                        action='store', help='section type')
+    parser.add_argument('--mem-type', choices=['fast', 'chip'], default='chip',
+                        action='store', help='section memory type')
+
+    args = parser.parse_args()
+
+    data = '\n'.join(_data(args.file))
+
+    symbol = args.symbol
+    if args.symbol is None:
+        symbol = _filename_to_symbol(args.file)
+
+    sec_name = args.sec_name if args.sec_name else f'{symbol}_section'
+
+    out = _section_template.format(symbol=symbol,
+                                   sec_name=sec_name,
+                                   sec_type=args.sec_type,
+                                   mem_type=args.mem_type,
+                                   data=data)
+
+    print(out, end='')
+
+if __name__ == '__main__':
+    main()
